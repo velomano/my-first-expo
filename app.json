@@ -8,8 +8,17 @@
     "scheme": "myfirstexpo",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
+
+    "extra": {
+      "EXPO_PUBLIC_SUPABASE_URL": "https://<YOUR-PROJECT>.supabase.co",
+      "EXPO_PUBLIC_SUPABASE_ANON_KEY": "<YOUR_ANON_KEY>"
+    },
+
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "바코드 스캔을 위해 카메라 접근이 필요합니다."
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -33,7 +42,8 @@
           "resizeMode": "contain",
           "backgroundColor": "#ffffff"
         }
-      ]
+      ],
+      "expo-secure-store"
     ],
     "experiments": {
       "typedRoutes": true
