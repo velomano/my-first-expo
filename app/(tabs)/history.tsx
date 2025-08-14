@@ -1,216 +1,189 @@
-﻿import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
-import {
-  SafeAreaView,
-} from 'react-native-safe-area-context';
-import {
-  View,
-  FlatList,
-  Pressable,
-  RefreshControl,
-  StyleSheet,
-  Alert,
-} from 'react-native';
-import { ThemedView } from '@/components/ThemedView';
+﻿import { useCallback, useEffect, useState } from 'react';
+import { Alert, FlatList, Pressable, RefreshControl, StyleSheet } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+
 import { ThemedText } from '@/components/ThemedText';
+import { ThemedView } from '@/components/ThemedView';
+import { bus } from '@/lib/bus';
 import { supabase } from '@/lib/supabase';
-import { ensureTenantId } from '@/lib/resolveTenant';
 
-type DbScan = {
+type Row = {
   id: number;
-  tenant_id: string;
+  client_ref: string;
+  tenant_id: string | null;
   user_id: string;
+  type: 'qrcode' | 'barcode';
   value: string;
-  type: string | null;
-  meta: any | null;
   created_at: string;
+  meta: any;
 };
 
-const PAGE_SIZE = 20;
-
-const pad = (n: number) => String(n).padStart(2, '0');
-const fmtLocal24 = (iso: string) => {
-  const d = new Date(iso);
-  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-};
-
-const looksLikeLink = (s: string) =>
-  /^[a-z][a-z0-9+\-.]*:\/\//i.test(s) ||
-  /^([a-z0-9-]+\.)+[a-z]{2,}(:\d+)?(\/|$)/i.test(s) ||
-  /^\d{1,3}(\.\d{1,3}){3}(:\d+)?(\/|$)/.test(s);
-
-async function openValue(raw: string) {
-  const url = raw.trim();
-  const hasScheme = /^[a-z][a-z0-9+\-.]*:\/\//i.test(url);
-  const isHttp = /^https?:\/\//i.test(url);
-  try {
-    const WebBrowser = await import('expo-web-browser');
-    const Linking = await import('expo-linking');
-    if (!hasScheme) { await WebBrowser.openBrowserAsync(`http://${url}`); return; }
-    if (isHttp) await WebBrowser.openBrowserAsync(url);
-    else await Linking.openURL(url);
-  } catch {
-    Alert.alert('열 수 없음', '해당 값을 여는 데 실패했어요.');
-  }
-}
-
-async function copyValue(text: string) {
-  try {
-    const { setStringAsync } = await import('expo-clipboard');
-    await setStringAsync(text);
-    Alert.alert('복사됨', '값을 클립보드에 복사했어요.');
-  } catch {
-    Alert.alert('복사 실패', '클립보드에 복사하지 못했어요.');
-  }
-}
+const PAGE = 50;
 
 export default function HistoryScreen() {
-  const [tenantId, setTenantId] = useState<string | null>(null);
-  const [items, setItems] = useState<DbScan[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState<Row[]>([]);
+  const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const [hasMore, setHasMore] = useState(true);
-  const offsetRef = useRef(0);
 
-  // 테넌트 결정
-  useEffect(() => {
-    (async () => {
-      const t = await ensureTenantId();
-      setTenantId(t);
-    })();
-  }, []);
-
-  // 첫 페이지 로드
-  const loadFirst = useCallback(async () => {
-    if (!tenantId) return;
+  const loadInitial = useCallback(async () => {
     setLoading(true);
-    offsetRef.current = 0;
-    const { data, error } = await supabase
-      .from('scans')
-      .select('id, tenant_id, user_id, value, type, meta, created_at')
-      .eq('tenant_id', tenantId)
-      .order('created_at', { ascending: false })
-      .range(0, PAGE_SIZE - 1);
-    if (error) { Alert.alert('조회 오류', error.message); setLoading(false); return; }
-    setItems(data ?? []);
-    setHasMore((data?.length ?? 0) === PAGE_SIZE);
-    offsetRef.current = (data?.length ?? 0);
-    setLoading(false);
-  }, [tenantId]);
-
-  // 더 불러오기
-  const loadMore = useCallback(async () => {
-    if (!tenantId || !hasMore || loading) return;
-    const from = offsetRef.current;
-    const to = from + PAGE_SIZE - 1;
-    const { data, error } = await supabase
-      .from('scans')
-      .select('id, tenant_id, user_id, value, type, meta, created_at')
-      .eq('tenant_id', tenantId)
-      .order('created_at', { ascending: false })
-      .range(from, to);
-    if (error) { return; }
-    const got = data ?? [];
-    setItems(prev => [...prev, ...got]);
-    setHasMore(got.length === PAGE_SIZE);
-    offsetRef.current += got.length;
-  }, [tenantId, hasMore, loading]);
-
-  // 풀투리프레시
-  const onRefresh = useCallback(async () => {
-    setRefreshing(true);
-    await loadFirst();
-    setRefreshing(false);
-  }, [loadFirst]);
-
-  // 구독(INSERT/DELETE)
-  useEffect(() => {
-    if (!tenantId) return;
-    loadFirst();
-
-    const ch = supabase
-      .channel(`scans-${tenantId}`)
-      .on('postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'scans', filter: `tenant_id=eq.${tenantId}` },
-        (payload) => {
-          const row = payload.new as DbScan;
-          setItems(prev => {
-            // 중복 삽입 방지(id 중복)
-            if (prev.find(p => p.id === row.id)) return prev;
-            return [row, ...prev];
-          });
-        })
-      .on('postgres_changes',
-        { event: 'DELETE', schema: 'public', table: 'scans', filter: `tenant_id=eq.${tenantId}` },
-        (payload) => {
-          const old = payload.old as { id: number };
-          setItems(prev => prev.filter(p => p.id !== old.id));
-        })
-      .subscribe();
-
-    return () => { supabase.removeChannel(ch); };
-  }, [tenantId, loadFirst]);
-
-  const remove = useCallback(async (row: DbScan) => {
     try {
-      const { error } = await supabase
+      const session = (await supabase.auth.getSession()).data.session;
+      const uid = session?.user?.id;
+      if (!uid) return;
+
+      const { data, error } = await supabase
         .from('scans')
-        .delete()
-        .eq('id', row.id)
-        .eq('tenant_id', row.tenant_id); // RLS 하에서 안전
+        .select('id, client_ref, tenant_id, user_id, type, value, created_at, meta')
+        .eq('user_id', uid)
+        .order('created_at', { ascending: false })
+        .limit(PAGE);
+
       if (error) throw error;
+      setRows(data ?? []);
     } catch (e: any) {
-      Alert.alert('삭제 오류', e?.message ?? '삭제 실패');
+      Alert.alert('로드 실패', e?.message ?? '이력 불러오기에 실패했습니다.');
+    } finally {
+      setLoading(false);
     }
   }, []);
 
-  const renderItem = useCallback(({ item }: { item: DbScan }) => {
-    const isLink = looksLikeLink(item.value);
-    return (
-      <ThemedView style={styles.row}>
-        <View style={{ flex: 1 }}>
-          <ThemedText selectable numberOfLines={1}>{item.value}</ThemedText>
-          <ThemedText style={styles.meta}>
-            {fmtLocal24(item.created_at)} {item.type ? `• ${item.type}` : ''}
-          </ThemedText>
-        </View>
-        {isLink && (
-          <Pressable style={styles.smallBtn} onPress={() => openValue(item.value)}>
-            <ThemedText>열기</ThemedText>
-          </Pressable>
-        )}
-        <Pressable style={styles.smallBtn} onPress={() => copyValue(item.value)}>
-          <ThemedText>복사</ThemedText>
-        </Pressable>
-        <Pressable style={styles.smallBtn} onPress={() => remove(item)}>
-          <ThemedText>삭제</ThemedText>
-        </Pressable>
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    await loadInitial();
+    setRefreshing(false);
+  }, [loadInitial]);
+
+  // 최초 로드
+  useEffect(() => {
+    loadInitial();
+  }, [loadInitial]);
+
+  // ✅ 이벤트 버스: INSERT 즉시 반영
+  useEffect(() => {
+    const off = bus.on<Row>('scan:insert', (r) => {
+      setRows(prev => {
+        if (prev.some(x => x.id === r.id)) return prev;
+        return [r, ...prev].slice(0, PAGE);
+      });
+    });
+    return off;
+  }, []);
+
+  // ✅ 이벤트 버스: DELETE 즉시 반영(이 화면에서 삭제할 때)
+  useEffect(() => {
+    const off = bus.on<number>('scan:delete', (id) => {
+      setRows(prev => prev.filter(x => x.id !== id));
+    });
+    return off;
+  }, []);
+
+  // ✅ Supabase Realtime (백업용, 서버에서 발생한 변경도 반영)
+  useEffect(() => {
+    let channel: ReturnType<typeof supabase.channel> | null = null;
+
+    (async () => {
+      const session = (await supabase.auth.getSession()).data.session;
+      const uid = session?.user?.id;
+      if (!uid) return;
+
+      channel = supabase
+        .channel('scans-realtime')
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'scans', filter: `user_id=eq.${uid}` },
+          (payload) => {
+            if (payload.eventType === 'INSERT') {
+              const r = payload.new as Row;
+              setRows(prev => (prev.some(x => x.id === r.id) ? prev : [r, ...prev].slice(0, PAGE)));
+            } else if (payload.eventType === 'UPDATE') {
+              const r = payload.new as Row;
+              setRows(prev => prev.map(x => (x.id === r.id ? r : x)));
+            } else if (payload.eventType === 'DELETE') {
+              const r = payload.old as Row;
+              setRows(prev => prev.filter(x => x.id !== (r.id as any)));
+            }
+          }
+        )
+        .subscribe((status) => {
+          if (status === 'SUBSCRIBED') {
+            // 서버 상태와 맞추기 위해 최초 한 번 동기화(선택)
+            loadInitial();
+          }
+        });
+    })();
+
+    return () => {
+      if (channel) supabase.removeChannel(channel);
+    };
+  }, [loadInitial]);
+
+  const renderItem = ({ item }: { item: Row }) => (
+    <Pressable
+      style={styles.row}
+      onLongPress={async () => {
+        try {
+          const { error } = await supabase.from('scans').delete().eq('id', item.id);
+          if (error) throw error;
+          // 즉시 반영
+          bus.emit('scan:delete', item.id);
+        } catch (e: any) {
+          Alert.alert('삭제 실패', e?.message ?? '삭제 중 오류가 발생했습니다.');
+        }
+      }}
+    >
+      <ThemedView style={{ flex: 1 }}>
+        <ThemedText selectable numberOfLines={1}>{item.value}</ThemedText>
+        <ThemedText style={styles.meta}>
+          {new Date(item.created_at).toLocaleString()} • {item.type}
+        </ThemedText>
       </ThemedView>
-    );
-  }, [remove]);
+    </Pressable>
+  );
 
   return (
-    <SafeAreaView style={{ flex: 1 }} edges={['top','left','right','bottom']}>
-      <ThemedView style={{ paddingHorizontal: 20, paddingTop: 12, paddingBottom: 8 }}>
+    <SafeAreaView style={{ flex: 1 }}>
+      <ThemedView style={styles.header}>
         <ThemedText type="title">스캔 이력</ThemedText>
-        {tenantId && (
-          <ThemedText style={{ opacity: 0.7, marginTop: 4 }}>
-            Tenant: {tenantId.slice(0, 8)}…
-          </ThemedText>
-        )}
+        <ThemedText style={styles.sub}>실시간 업데이트</ThemedText>
       </ThemedView>
 
       <FlatList
-        data={items}
-        keyExtractor={(it) => String(it.id)}
+        data={rows}
+        keyExtractor={(item) => String(item.id)}
         renderItem={renderItem}
-        contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 24 }}
+        contentContainerStyle={{ padding: 16 }}
         refreshControl={
           <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
         }
         onEndReachedThreshold={0.2}
-        onEndReached={loadMore}
+        onEndReached={async () => {
+          if (rows.length < PAGE) return;
+          try {
+            const last = rows[rows.length - 1]?.created_at;
+            if (!last) return;
+            const session = (await supabase.auth.getSession()).data.session;
+            const uid = session?.user?.id;
+            if (!uid) return;
+
+            const { data, error } = await supabase
+              .from('scans')
+              .select('id, client_ref, tenant_id, user_id, type, value, created_at, meta')
+              .eq('user_id', uid)
+              .lt('created_at', last)
+              .order('created_at', { ascending: false })
+              .limit(PAGE);
+
+            if (error) throw error;
+            setRows(prev => [...prev, ...(data ?? [])]);
+          } catch {}
+        }}
         ListEmptyComponent={
-          !loading ? <ThemedText style={{ paddingHorizontal: 20 }}>데이터가 없습니다.</ThemedText> : null
+          !loading ? (
+            <ThemedText style={{ textAlign: 'center', marginTop: 24 }}>
+              아직 데이터가 없어요.
+            </ThemedText>
+          ) : null
         }
       />
     </SafeAreaView>
@@ -218,13 +191,11 @@ export default function HistoryScreen() {
 }
 
 const styles = StyleSheet.create({
+  header: { paddingHorizontal: 16, paddingTop: 12, paddingBottom: 8 },
+  sub: { opacity: 0.7, marginTop: 4 },
   row: {
-    flexDirection: 'row', alignItems: 'center', gap: 8,
-    paddingVertical: 8, borderBottomWidth: StyleSheet.hairlineWidth,
+    paddingVertical: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
   },
   meta: { opacity: 0.7, fontSize: 12, marginTop: 2 },
-  smallBtn: {
-    paddingVertical: 6, paddingHorizontal: 10,
-    borderRadius: 999, borderWidth: 1, alignSelf: 'center',
-  },
 });
